@@ -1,363 +1,485 @@
 #!/usr/bin/env python3
-"""Forecast GTA VI trophy earn-rates at a future checkpoint.
+"""Week-one trophy earn-rate forecaster for Grand Theft Auto VI (PS5).
 
-Model: decompose each trophy's earn rate into earners / players_tracked,
-project both series to the target time, then recombine. Players grow
-(even when the read history looks frozen, because the tracker refreshes
-in lagged jumps); earners grow sublinearly with players, with a
-trophy-specific elasticity, plus a slow progression term as existing
-players keep playing. Quantiles are built on the logit scale with a
-spread that widens with horizon and with small earner counts.
+Reads make.fun case files (schema makefun/gta6-trophies-case/v1) from
+$MAKEFUN_INPUT_DIR (default /input) and writes one forecast per case to
+$MAKEFUN_OUTPUT_DIR (default /output).  For every trophy it emits five
+quantiles of the earn rate (percent of tracked players) at the case target.
 
-Reads every *.in JSON case from $MAKEFUN_INPUT_DIR (default /input/)
-and writes <case>.out JSON files to $MAKEFUN_OUTPUT_DIR (default
-/output/). Standard library only, deterministic.
+Model sketch
+------------
+Each trophy's logit earn rate is tracked over time (hours since release).
+Three forces move it during week one:
+
+* progression  -- the launch cohort plays deeper into the game, so story
+  and side-content trophies climb from their launch-night trickle;
+* dilution     -- the tracked-player denominator grows fast and late
+  arrivals are more casual, dragging hard-trophy rates down;
+* page staleness -- Exophase refreshes in jumps, so a run of identical
+  reads hides a pending re-basing of every rate.
+
+The median forecast blends a weighted logit-vs-log-time trend fitted on
+recent distinct reads with a class-prior drift (story / collectible /
+feat / economy / completion ...).  The spread combines a random-walk
+term over the horizon, fit residuals, binomial count noise from the
+small early player pool, a staleness bonus and a per-class uncertainty.
+Everything is deterministic: no randomness anywhere.
 """
 
+import glob
 import json
 import math
 import os
+import statistics
 import sys
 from datetime import datetime, timezone
-from statistics import NormalDist
 
-EPS_P = 1e-6          # clamp for probabilities before logit
-Q_MIN = 0.0001        # output clamp, percent
-Q_MAX = 99.9999       # output clamp, percent
+RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
+EPS_PCT = 0.01          # scorer clamps rates to [0.01, 99.99] for logits
 DEFAULT_LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-_NORM = NormalDist()
+NORMAL = statistics.NormalDist()
 
-# Fallback median earn-rate (percent) when a trophy has no usable reads.
-TIER_RATE_PRIOR = {"platinum": 0.02, "gold": 0.1, "silver": 0.4, "bronze": 1.2}
-# Expected earner fraction among tracked players when last read shows 0.
-TIER_ZERO_FRAC = {"platinum": 2e-5, "gold": 1e-4, "silver": 3e-4, "bronze": 6e-4}
-TIER_BETA_ADJ = {"platinum": -0.08, "gold": -0.03, "silver": 0.0, "bronze": 0.03}
-TIER_PROG = {"bronze": 1.0, "silver": 0.8, "gold": 0.5, "platinum": 0.25}
 
+# --------------------------------------------------------------------------
+# small numeric helpers
+# --------------------------------------------------------------------------
 
 def clamp(x, lo, hi):
     return lo if x < lo else hi if x > hi else x
 
 
-def parse_ts(text):
-    """Parse an ISO timestamp into epoch seconds (float). None on failure."""
-    if not text or not isinstance(text, str):
-        return None
-    s = text.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    try:
-        dt = datetime.fromisoformat(s)
-    except ValueError:
-        return None
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return dt.timestamp()
-
-
-def logit(p):
-    p = clamp(p, EPS_P, 1.0 - EPS_P)
+def logit_pct(pct):
+    """Percent -> logit, with the scorer's clamping."""
+    p = clamp(pct, EPS_PCT, 100.0 - EPS_PCT) / 100.0
     return math.log(p / (1.0 - p))
 
 
-def sigmoid(x):
-    if x >= 0:
-        return 1.0 / (1.0 + math.exp(-x))
-    e = math.exp(x)
-    return e / (1.0 + e)
+def pct_from_logit(z):
+    if z >= 0:
+        return 100.0 / (1.0 + math.exp(-z))
+    e = math.exp(z)
+    return 100.0 * e / (1.0 + e)
 
 
-def ols(xs, ys):
-    """Least-squares (intercept, slope); None when degenerate."""
+def parse_time(text):
+    """ISO-8601 UTC string -> aware datetime (None when unusable)."""
+    if not isinstance(text, str):
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def hours_since_release(moment):
+    if moment is None:
+        return 0.0
+    return max(0.0, (moment - RELEASE).total_seconds() / 3600.0)
+
+
+def log_clock(hours):
+    """Log-time axis: fast early movement, slow later movement."""
+    return math.log1p(max(0.0, hours))
+
+
+# --------------------------------------------------------------------------
+# trophy behaviour classes and their priors
+# --------------------------------------------------------------------------
+
+# drift: expected logit change per unit of log-time when no trend is fit.
+# dilute: share of log player-growth that drags the rate down.
+# spread: extra logit uncertainty for the class.
+CLASS_PRIORS = {
+    "opening":    {"drift": 0.00, "dilute": 0.05, "spread": 0.30},
+    "story_early": {"drift": 0.55, "dilute": 0.25, "spread": 0.50},
+    "story_mid":  {"drift": 0.45, "dilute": 0.35, "spread": 0.55},
+    "story_end":  {"drift": 0.35, "dilute": 0.45, "spread": 0.60},
+    "side_strand": {"drift": 0.30, "dilute": 0.45, "spread": 0.60},
+    "collectible": {"drift": 0.25, "dilute": 0.55, "spread": 0.65},
+    "grind":      {"drift": 0.20, "dilute": 0.55, "spread": 0.65},
+    "feat":       {"drift": 0.30, "dilute": 0.40, "spread": 0.60},
+    "economy":    {"drift": 0.30, "dilute": 0.45, "spread": 0.60},
+    "completion": {"drift": 0.15, "dilute": 0.60, "spread": 0.70},
+    "platinum":   {"drift": 0.10, "dilute": 0.60, "spread": 0.70},
+    "misc":       {"drift": 0.30, "dilute": 0.45, "spread": 0.60},
+}
+
+TIER_FALLBACK_PCT = {"platinum": 0.10, "gold": 0.40, "silver": 0.60, "bronze": 1.20}
+
+
+def classify(trophy):
+    """Map a trophy to a behaviour class from its tier and text."""
+    tier = str(trophy.get("tier", "")).lower()
+    name = str(trophy.get("name", "")).lower()
+    desc = str(trophy.get("description", "")).lower()
+    text = name + " | " + desc
+
+    if tier == "platinum":
+        return "platinum"
+    if "100% completion" in text:
+        return "completion"
+    if "gone fishing" in text or "in the beginning" in text:
+        return "opening"
+    if "final mission" in text and " for " not in desc:
+        return "story_end"
+    if "final mission for" in text or "strangers" in text or "mission strands" in text:
+        return "side_strand"
+    if "chapter 1" in text or "chapter 2" in text:
+        return "story_early"
+    if "chapter" in text:
+        return "story_mid"
+    collect_words = ("collectible", "discover 100", "explore all", "purchase all",
+                     "every location", "every spot", "100 locations", "sets")
+    if any(w in text for w in collect_words):
+        return "collectible"
+    grind_words = ("250 stunts", "gold medal in all", "50 challenges",
+                   "win 20", "try each type", "register 10")
+    if any(w in text for w in grind_words):
+        return "grind"
+    if "$" in desc or "spend" in desc or "earn $" in desc or "laundering" in text:
+        return "economy"
+    feat_words = ("rob ", "escape", "win ", "beat ", "complete an", "take down",
+                  "lose a", "hunt ", "meditate", "bowl", "smash", "enjoy a",
+                  "follow-through", "make an unscheduled", "choices made")
+    if any(w in text for w in feat_words):
+        return "feat"
+    if desc.startswith("complete "):
+        return "story_mid"
+    return "misc"
+
+
+# --------------------------------------------------------------------------
+# series handling
+# --------------------------------------------------------------------------
+
+def build_series(case, index):
+    """(hours, rate_pct, players) points for one trophy, oldest first."""
+    points = []
+    for read in case.get("history") or []:
+        rates = read.get("rates") or []
+        if index >= len(rates):
+            continue
+        rate = rates[index]
+        if rate is None:
+            continue
+        try:
+            rate = float(rate)
+        except (TypeError, ValueError):
+            continue
+        moment = parse_time(read.get("at")) or parse_time(read.get("slot"))
+        players = read.get("players_tracked")
+        try:
+            players = float(players) if players is not None else None
+        except (TypeError, ValueError):
+            players = None
+        points.append((hours_since_release(moment), rate, players))
+    return points
+
+
+def collapse_stale(points):
+    """Merge consecutive reads with identical (rate, players).
+
+    Returns (distinct_points, stale_hours) where stale_hours is how long
+    the page has sat unchanged up to the newest read.
+    """
+    if not points:
+        return [], 0.0
+    distinct = [points[0]]
+    for pt in points[1:]:
+        prev = distinct[-1]
+        if pt[1] == prev[1] and pt[2] == prev[2]:
+            distinct[-1] = (pt[0], pt[1], pt[2])  # keep newest time of the run
+        else:
+            distinct.append(pt)
+    stale = 0.0
+    if len(points) >= 2:
+        last_change = points[0][0]
+        for i in range(1, len(points)):
+            if points[i][1] != points[i - 1][1] or points[i][2] != points[i - 1][2]:
+                last_change = points[i][0]
+        stale = max(0.0, points[-1][0] - last_change)
+    return distinct, stale
+
+
+def weighted_line(xs, ys, ws):
+    """Weighted least squares y = a + b*x. Returns (a, b, resid_std) or None."""
     n = len(xs)
     if n < 2:
         return None
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
+    sw = sum(ws)
+    if sw <= 0:
+        return None
+    mx = sum(w * x for x, w in zip(xs, ws)) / sw
+    my = sum(w * y for y, w in zip(ys, ws)) / sw
+    sxx = sum(w * (x - mx) ** 2 for x, w in zip(xs, ws))
     if sxx <= 1e-12:
         return None
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    sxy = sum(w * (x - mx) * (y - my) for x, y, w in zip(xs, ys, ws))
     slope = sxy / sxx
-    return (my - slope * mx, slope)
+    intercept = my - slope * mx
+    resid = math.sqrt(sum(w * (y - (intercept + slope * x)) ** 2
+                          for x, y, w in zip(xs, ys, ws)) / sw)
+    return intercept, slope, resid
 
 
-def change_points(times, values):
-    """Collapse consecutive repeats, keeping the first time of each value."""
+def fit_trend(distinct, target_hours):
+    """Logit-vs-log-time trend over the last 24h of distinct reads.
+
+    Returns (predicted_logit, slope, resid_std, weight) or None.
+    """
+    if len(distinct) < 3:
+        return None
+    newest = distinct[-1][0]
+    recent = [p for p in distinct if p[0] >= newest - 24.0]
+    if len(recent) < 3:
+        recent = distinct
+    span = recent[-1][0] - recent[0][0]
+    if span < 1.0:
+        return None
+    xs = [log_clock(p[0]) for p in recent]
+    ys = [logit_pct(p[1]) for p in recent]
+    # recency weights: newest read counts most
+    ws = [0.35 + 0.65 * (p[0] - recent[0][0]) / span for p in recent]
+    fit = weighted_line(xs, ys, ws)
+    if fit is None:
+        return None
+    intercept, slope, resid = fit
+    slope = clamp(slope, -2.5, 2.5)
+    x_target = log_clock(target_hours)
+    x_last = xs[-1]
+    # shrink long extrapolations: trust the slope less the further we go
+    reach = x_target - x_last
+    shrink = 1.0 / (1.0 + 0.35 * max(0.0, reach))
+    predicted = ys[-1] + slope * reach * shrink
+    weight = (len(recent) / (len(recent) + 4.0)) * min(1.0, span / 12.0)
+    return predicted, slope, resid, clamp(weight, 0.0, 0.85)
+
+
+def fit_player_growth(case, target_hours):
+    """Predicted tracked-player growth factor to the target (>= 1).
+
+    Returns (growth, last_players, observed).  When the history shows
+    fewer than three distinct player counts (a stale launch-night page),
+    fall back to a launch power-law prior: the tracked pool grows roughly
+    like (1 + hours)^2 in the first days as syncs catch up.
+    """
+    seen = []
+    for read in case.get("history") or []:
+        players = read.get("players_tracked")
+        if players is None:
+            continue
+        try:
+            players = float(players)
+        except (TypeError, ValueError):
+            continue
+        if players <= 0:
+            continue
+        moment = parse_time(read.get("at")) or parse_time(read.get("slot"))
+        seen.append((hours_since_release(moment), players))
+    if not seen:
+        return 1.0, None, False
+    # distinct player counts only
+    distinct = [seen[0]]
+    for pt in seen[1:]:
+        if pt[1] != distinct[-1][1]:
+            distinct.append(pt)
+    last_hours, last_players = seen[-1]
+    if len(distinct) < 3:
+        ratio = (1.0 + target_hours) / (1.0 + last_hours)
+        prior_growth = clamp(ratio ** 2.0, 1.0, 15.0)
+        return prior_growth, last_players, False
+    xs = [log_clock(p[0]) for p in distinct]
+    ys = [math.log(p[1]) for p in distinct]
+    ws = [1.0] * len(distinct)
+    fit = weighted_line(xs, ys, ws)
+    if fit is None:
+        return 1.0, last_players, True
+    intercept, slope, _ = fit
+    slope = clamp(slope, 0.0, 3.0)
+    predicted = math.exp(intercept + slope * log_clock(target_hours))
+    growth = clamp(predicted / last_players, 1.0, 40.0)
+    return growth, last_players, True
+
+
+def effective_dilution(base, horizon_days):
+    """How much of the log player-growth drags a rate down.
+
+    Over minutes-to-hours, new arrivals have earned almost nothing, so
+    dilution is nearly one-for-one.  Over days they catch up on easy
+    content, and the pass-through decays toward the class base rate.
+    The opening trophy is exempt: being tracked at all means having
+    started the game, so its earners arrive with the denominator.
+    """
+    if base < 0.1:
+        return base
+    return base + (1.0 - base) * math.exp(-max(horizon_days, 0.0) / 2.0)
+
+
+# --------------------------------------------------------------------------
+# per-trophy forecast
+# --------------------------------------------------------------------------
+
+def forecast_trophy(case, trophy, index, target_hours, horizon_days,
+                    growth, last_players, growth_observed, levels):
+    prior = CLASS_PRIORS[classify(trophy)]
+    points = build_series(case, index)
+    distinct, stale_hours = collapse_stale(points)
+
+    if not distinct:
+        tier = str(trophy.get("tier", "bronze")).lower()
+        median_pct = TIER_FALLBACK_PCT.get(tier, 1.0)
+        median_logit = logit_pct(median_pct)
+        sigma = 1.2 + 0.5 * math.sqrt(max(horizon_days, 0.0))
+        return quantiles_from(median_logit, sigma, levels)
+
+    last_hours, last_rate, _ = distinct[-1]
+    last_logit = logit_pct(last_rate)
+    dilute = effective_dilution(prior["dilute"], horizon_days)
+
+    # --- median -----------------------------------------------------------
+    log_reach = max(0.0, log_clock(target_hours) - log_clock(last_hours))
+    prior_move = prior["drift"] * log_reach
+    # expected dilution from denominator growth over the horizon
+    dilution_move = -dilute * math.log(max(growth, 1.0))
+
+    trend = fit_trend(distinct, target_hours)
+    if trend is not None:
+        trend_logit, _slope, resid, w = trend
+        # the fitted trend already reflects past dilution; add only the
+        # part of expected future dilution beyond a mild baseline
+        extra_dilution = -dilute * max(0.0, math.log(max(growth, 1.0)) - 0.4)
+        median_logit = w * trend_logit + (1.0 - w) * (last_logit + prior_move + dilution_move)
+        median_logit += w * extra_dilution
+    else:
+        resid = 0.0
+        median_logit = last_logit + prior_move + dilution_move
+
+    # a stale page hides a refresh: when growth was never observed, the
+    # power-law prior already prices the jump; when it was observed but
+    # the tail went stale, trust the fit less and widen below
+    stale_factor = clamp(stale_hours / 3.0, 0.0, 1.0)
+    if stale_factor > 0 and not growth_observed:
+        median_logit -= dilute * math.log(max(growth, 1.0)) * 0.25 * stale_factor
+
+    median_logit = clamp(median_logit, last_logit - 3.0, last_logit + 3.0)
+
+    # earners never un-earn: the median may not imply fewer earners than
+    # the last read already counted (allowing 5% slack for pool churn)
+    if last_players:
+        earners_last = last_rate / 100.0 * last_players
+        players_pred = last_players * max(growth, 1.0)
+        floor_pct = 100.0 * earners_last * 0.95 / players_pred
+        median_logit = max(median_logit, logit_pct(floor_pct))
+
+    # --- spread -----------------------------------------------------------
+    walk = 0.5 * math.sqrt(max(horizon_days, 0.0))
+    earners = max(1.0, last_rate / 100.0 * (last_players or 1000.0))
+    others = max(1.0, (last_players or 1000.0) - earners)
+    count_noise = math.sqrt(1.0 / earners + 1.0 / others)
+    stale_bonus = 1.0 * stale_factor
+    sigma = math.sqrt(walk ** 2 + resid ** 2 + (0.6 * count_noise) ** 2
+                      + stale_bonus ** 2 + prior["spread"] ** 2)
+    # near 100% the logit scale stretches enormously: a dip from 100 to
+    # 98 is five logit units, so a saturated trophy needs a wide band
+    if last_rate >= 99.5:
+        sigma = max(sigma, 2.2 + 0.4 * math.sqrt(max(horizon_days, 0.0)))
+    sigma = clamp(sigma, 0.18, 3.5)
+
+    return quantiles_from(median_logit, sigma, levels)
+
+
+def quantiles_from(median_logit, sigma, levels):
+    row = []
+    for tau in levels:
+        z = NORMAL.inv_cdf(clamp(tau, 1e-6, 1.0 - 1e-6))
+        row.append(pct_from_logit(median_logit + z * sigma))
+    # clamp, round, enforce non-decreasing
     out = []
-    for t, v in zip(times, values):
-        if not out or v != out[-1][1]:
-            out.append((t, v))
+    prev = 0.0
+    for value in row:
+        value = clamp(round(value, 4), 0.0, 100.0)
+        if value < prev:
+            value = prev
+        out.append(value)
+        prev = value
     return out
 
 
-def forecast_players(times_h, players, t_target_h, horizon_h):
-    """Project players_tracked to the target. Returns (p_future, frozen)."""
-    p_last = float(players[-1])
-    pts = change_points(times_h, [float(p) for p in players])
-    span = times_h[-1] - times_h[0] if len(times_h) > 1 else 0.0
-    lo_p = min(players)
-    hi_p = max(players)
-    frozen = len(pts) <= 1 or (lo_p > 0 and hi_p / lo_p < 1.02)
+# --------------------------------------------------------------------------
+# case driver
+# --------------------------------------------------------------------------
 
-    if frozen or span < 0.5 or len(pts) < 3:
-        # Dilution prior: tracked players keep growing even when reads
-        # look frozen (tracker refreshes lag, then jump). Fast early
-        # catch-up plus a slow tail; smaller bases grow faster.
-        log_g = 1.75 * (1.0 - math.exp(-horizon_h / 1.2)) \
-            + 0.55 * math.log1p(horizon_h / 24.0)
-        size_factor = (638.0 / max(p_last, 1.0)) ** 0.15
-        log_g *= clamp(size_factor, 0.4, 1.3)
-        g = math.exp(log_g)
-        if len(pts) >= 2 and pts[0][1] > 0:
-            observed = pts[-1][1] / pts[0][1]
-            g = max(g, min(observed, 3.0))
-        return p_last * max(g, 1.0), True
-
-    t_last = times_h[-1]
-    # Fit A: power law, log P against log(1 + t).
-    xs = [math.log1p(t) for t, _ in pts]
-    ys = [math.log(max(p, 1.0)) for _, p in pts]
-    fit_a = ols(xs, ys)
-    log_a = math.log(max(p_last, 1.0))
-    if fit_a is not None:
-        a, b = fit_a
-        b = clamp(b, 0.0, 1.3)
-        log_a = max(a + b * math.log1p(max(t_target_h, 0.0)),
-                    math.log(max(p_last, 1.0)))
-
-    # Fit B: recent exponential growth with decaying rate.
-    window = max(6.0, 0.25 * span)
-    recent = [(t, p) for t, p in pts if t >= t_last - window]
-    if len(recent) < 2:
-        recent = pts[-2:]
-    fit_b = ols([t for t, _ in recent],
-                [math.log(max(p, 1.0)) for _, p in recent])
-    log_b = math.log(max(p_last, 1.0))
-    if fit_b is not None:
-        g_rate = clamp(fit_b[1], 0.0, 0.5)
-        tau = 30.0
-        log_b = math.log(max(p_last, 1.0)) \
-            + g_rate * tau * (1.0 - math.exp(-horizon_h / tau))
-
-    # With a long history the launch surge bends the power law, so lean
-    # on the recent-growth fit; with a short one, split evenly.
-    w_recent = 0.65 if span >= 24.0 else 0.5
-    log_f = (1.0 - w_recent) * log_a + w_recent * log_b
-    p_future = math.exp(log_f)
-    g_max = 4.0 + horizon_h / 12.0
-    p_future = clamp(p_future, p_last, p_last * g_max)
-    return p_future, False
-
-
-def beta_prior(p_frac, tier):
-    """Prior elasticity of earners w.r.t. players, from rate level + tier."""
-    p = clamp(p_frac, 0.0, 1.0)
-    b = 0.10 + 0.88 * (p ** 0.35) + TIER_BETA_ADJ.get(tier, 0.0)
-    return clamp(b, 0.02, 0.99)
-
-
-def fit_earner_elasticities(earners, players, times_h, beta0, c0):
-    """Fit log earners on log players (b) and log(1 + t) (c), FWL-style.
-
-    Earners grow because more tracked players arrive and because the
-    players already tracked keep playing. The two regressors move
-    together, so the time slope is identified only from the part of
-    log(1 + t) that log players cannot explain (Frisch-Waugh-Lovell),
-    then shrunk toward its prior c0 by how much independent variation
-    exists; b is adjusted by the FWL identity and lightly shrunk
-    toward beta0. Returns (b, c), or None when there is too little
-    variation to fit.
-    """
-    pts = []
-    last_p = None
-    for e, p, t in zip(earners, players, times_h):
-        if e is None or p is None or e <= 0 or p <= 0:
-            continue
-        row = (math.log(p), math.log1p(max(t, 0.0)), math.log(e))
-        if last_p is not None and p == last_p:
-            pts[-1] = row
-        else:
-            pts.append(row)
-            last_p = p
-    if len(pts) < 8:
-        return None
-    x1 = [r[0] for r in pts]
-    x2 = [r[1] for r in pts]
-    ys = [r[2] for r in pts]
-    if max(x1) - min(x1) < 0.3:
-        return None
-    fy = ols(x1, ys)
-    fx = ols(x1, x2)
-    if fy is None or fx is None:
-        return None
-    resid_y = [y - (fy[0] + fy[1] * a) for a, y in zip(x1, ys)]
-    resid_x = [b - (fx[0] + fx[1] * a) for a, b in zip(x1, x2)]
-    var_rx = sum(r * r for r in resid_x)
-    if var_rx < 1e-6:
-        c = c0
-    else:
-        c_raw = sum(a * b for a, b in zip(resid_y, resid_x)) / var_rx
-        rel = var_rx / (var_rx + 2.0)
-        c = rel * clamp(c_raw, 0.0, 0.6) + (1.0 - rel) * c0
-    c = clamp(c, 0.0, 0.35)
-    b = fy[1] - c * fx[1]
-    b = 0.8 * clamp(b, 0.0, 1.1) + 0.2 * beta0
-    return clamp(b, 0.0, 1.1), c
-
-
-def forecast_case(case):
-    trophies = case.get("trophies") or []
-    history = case.get("history") or []
+def process_case(case):
     levels = case.get("levels") or DEFAULT_LEVELS
-
-    # --- timeline -----------------------------------------------------
-    read_times = []
-    players_series = []
-    for h in history:
-        ts = parse_ts(h.get("at")) or parse_ts(h.get("slot"))
-        p = h.get("players_tracked")
-        if ts is None or p is None:
-            continue
-        read_times.append(ts)
-        players_series.append(float(p))
-
-    at_ts = parse_ts(case.get("at"))
-    target_ts = parse_ts(case.get("target"))
-    if target_ts is None:
-        base = at_ts if at_ts is not None else (read_times[-1] if read_times else 0.0)
-        target_ts = base + float(case.get("horizon_minutes") or 0) * 60.0
-
-    if read_times:
-        t0 = read_times[0]
-        times_h = [(t - t0) / 3600.0 for t in read_times]
-        t_target_h = (target_ts - t0) / 3600.0
-        horizon_h = max((target_ts - read_times[-1]) / 3600.0, 0.05)
-        p_future, frozen = forecast_players(
-            times_h, players_series, t_target_h, horizon_h)
-        p_last = players_series[-1]
-        g_players = p_future / p_last if p_last > 0 else 1.0
-        distinct_p = len(change_points(times_h, players_series))
+    levels = [float(x) for x in levels]
+    at = parse_time(case.get("at"))
+    target = parse_time(case.get("target"))
+    horizon_minutes = case.get("horizon_minutes")
+    if target is not None:
+        target_hours = hours_since_release(target)
+    elif at is not None and horizon_minutes is not None:
+        target_hours = hours_since_release(at) + float(horizon_minutes) / 60.0
     else:
-        horizon_h = max(float(case.get("horizon_minutes") or 0) / 60.0, 0.05)
-        p_future, frozen, p_last, g_players, distinct_p = 0.0, True, 0.0, 1.0, 0
+        target_hours = hours_since_release(at)
+    if horizon_minutes is not None:
+        horizon_days = float(horizon_minutes) / 1440.0
+    elif at is not None and target is not None:
+        horizon_days = max(0.0, (target - at).total_seconds() / 86400.0)
+    else:
+        horizon_days = 0.0
+
+    growth, last_players, growth_observed = fit_player_growth(case, target_hours)
 
     rows = []
-    for idx, trophy in enumerate(trophies):
-        tier = str(trophy.get("tier") or "").lower()
-
-        # Per-trophy earner series and latest usable rate.
-        earners = []
-        last_rate = None
-        last_earners = None
-        for h, p in zip(history, players_series) if read_times else []:
-            rates = h.get("rates") or []
-            r = rates[idx] if idx < len(rates) else None
-            if r is None:
-                earners.append(None)
-            else:
-                e = float(r) / 100.0 * p
-                earners.append(e)
-                last_rate = float(r)
-                last_earners = e
-
-        if last_rate is None or p_future <= 0:
-            # No usable reads: tier prior rate, wide spread.
-            p_frac = TIER_RATE_PRIOR.get(tier, 0.5) / 100.0
-            sigma = clamp(0.35 + 0.05 * math.sqrt(horizon_h) + 0.5, 0.25, 1.4)
-        else:
-            p_last_frac = clamp(last_rate / 100.0, 0.0, 1.0)
-            prior = beta_prior(p_last_frac, tier)
-            gamma0 = 0.22 * TIER_PROG.get(tier, 0.7) \
-                * math.sqrt(max(1.0 - p_last_frac, 0.0))
-            fit = fit_earner_elasticities(
-                earners, players_series, times_h, prior, 0.8 * gamma0)
-
-            if last_earners is None or last_earners <= 0:
-                e_future = 0.25 + p_future * TIER_ZERO_FRAC.get(tier, 3e-4)
-            elif fit is not None:
-                b_slope, c_slope = fit
-                d_log_t = math.log1p(max(t_target_h, 0.0)) \
-                    - math.log1p(max(times_h[-1], 0.0))
-                e_future = last_earners * math.exp(
-                    b_slope * math.log(max(g_players, 1e-9))
-                    + c_slope * max(d_log_t, 0.0))
-            else:
-                prog = 1.0 + gamma0 * math.log1p(horizon_h / 24.0)
-                e_future = last_earners * (g_players ** prior) * prog
-            cap_e = 0.999 * p_future
-            e_future = min(e_future, cap_e)
-            if last_earners is not None:
-                e_future = max(e_future, min(last_earners, cap_e))
-            p_frac = e_future / p_future if p_future > 0 else p_last_frac
-
-            sigma = 0.35 + 0.05 * math.sqrt(horizon_h)
-            if frozen:
-                sigma += 0.25
-            elif distinct_p < 3:
-                sigma += 0.10
-            if last_earners is not None and last_earners < 5:
-                sigma += 0.30 * (1.0 - max(last_earners, 0.0) / 5.0)
-            sigma = clamp(sigma, 0.25, 1.4)
-
-        mu = logit(p_frac)
-        quantiles = []
-        for lev in levels:
-            z = _NORM.inv_cdf(clamp(float(lev), 1e-9, 1.0 - 1e-9))
-            q = sigmoid(mu + z * sigma) * 100.0
-            quantiles.append(round(clamp(q, Q_MIN, Q_MAX), 4))
-        # Enforce non-decreasing order (levels are ascending per spec).
-        for i in range(1, len(quantiles)):
-            if quantiles[i] < quantiles[i - 1]:
-                quantiles[i] = quantiles[i - 1]
-        rows.append({"id": trophy.get("id"), "q": quantiles})
-
+    for index, trophy in enumerate(case.get("trophies") or []):
+        try:
+            q = forecast_trophy(case, trophy, index, target_hours,
+                                horizon_days, growth, last_players,
+                                growth_observed, levels)
+        except Exception:
+            q = [1.0] * len(levels)
+        rows.append({"id": trophy.get("id", index + 1), "q": q})
     return {"trophies": rows}
 
 
-def persistence_fallback(case):
-    """Last-resort forecast: last rates held flat with a modest spread."""
-    trophies = case.get("trophies") or []
-    history = case.get("history") or []
+def fallback_case(case):
+    """Last-resort forecast: last read's rates (or tier priors), wide band."""
     levels = case.get("levels") or DEFAULT_LEVELS
-    last_rates = (history[-1].get("rates") if history else []) or []
+    levels = [float(x) for x in levels]
     rows = []
-    for idx, trophy in enumerate(trophies):
-        r = last_rates[idx] if idx < len(last_rates) else None
-        p_frac = (float(r) / 100.0) if r is not None else 0.001
-        mu = logit(p_frac)
-        qs = []
-        for lev in levels:
-            z = _NORM.inv_cdf(clamp(float(lev), 1e-9, 1.0 - 1e-9))
-            qs.append(round(clamp(sigmoid(mu + z * 0.6) * 100.0, Q_MIN, Q_MAX), 4))
-        for i in range(1, len(qs)):
-            if qs[i] < qs[i - 1]:
-                qs[i] = qs[i - 1]
-        rows.append({"id": trophy.get("id"), "q": qs})
+    history = case.get("history") or []
+    last_rates = (history[-1].get("rates") or []) if history else []
+    for index, trophy in enumerate(case.get("trophies") or []):
+        rate = last_rates[index] if index < len(last_rates) else None
+        if rate is None:
+            tier = str(trophy.get("tier", "bronze")).lower()
+            rate = TIER_FALLBACK_PCT.get(tier, 1.0)
+        q = quantiles_from(logit_pct(float(rate)), 1.0, levels)
+        rows.append({"id": trophy.get("id", index + 1), "q": q})
     return {"trophies": rows}
 
 
 def main():
-    in_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
-    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
-    os.makedirs(out_dir, exist_ok=True)
-    try:
-        names = sorted(n for n in os.listdir(in_dir) if n.endswith(".in"))
-    except OSError:
-        return
-    for name in names:
-        stem = name[:-3]
-        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
-            case = json.load(fh)
+    input_dir = os.environ.get("MAKEFUN_INPUT_DIR") or "/input"
+    output_dir = os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output"
+    os.makedirs(output_dir, exist_ok=True)
+    for path in sorted(glob.glob(os.path.join(input_dir, "*.in"))):
+        stem = os.path.splitext(os.path.basename(path))[0]
         try:
-            result = forecast_case(case)
-        except Exception as exc:  # never lose a whole case to a crash
-            print(f"fallback for {name}: {exc}", file=sys.stderr)
-            result = persistence_fallback(case)
-        out_path = os.path.join(out_dir, stem + ".out")
+            with open(path, "r", encoding="utf-8") as fh:
+                case = json.load(fh)
+        except Exception:
+            continue
+        try:
+            result = process_case(case)
+        except Exception:
+            result = fallback_case(case)
+        out_path = os.path.join(output_dir, stem + ".out")
         with open(out_path, "w", encoding="utf-8") as fh:
-            fh.write(json.dumps(result, separators=(",", ":")))
+            json.dump(result, fh, separators=(",", ":"), ensure_ascii=False)
+            fh.write("\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
